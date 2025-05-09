@@ -1,40 +1,48 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form # Keep existing imports
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-import httpx # For making async HTTP requests to download the GLB file
-import trimesh # Assuming you'll use trimesh for conversion
+import httpx
+import trimesh
 import os
 import uuid
-import shutil # For cleaning up temporary files
+import shutil
 
-# Initialize FastAPI app
+print("Microservice app.py starting...")
+# Imports like FastAPI and CORSMiddleware should only be done once at the top.
+# No need to re-import them here.
+print("Initial imports successful.")
+
+# --- Initialize FastAPI app ONCE ---
 app = FastAPI(title="3D Model Conversion Microservice")
+print("FastAPI app initialized.")
 
 # --- CORS Configuration ---
-# Define the list of allowed origins (your frontend applications)
 origins = [
     "https://bloom-v0.vercel.app",    # Your deployed Next.js frontend
     "http://localhost:3000",        # Your local Next.js development server
     # Add any other frontend origins if necessary
 ]
+print(f"CORS origins defined: {origins}")
 
-# Add the CORS middleware to your app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,          # Allow specific origins
-    allow_credentials=True,       # Allow cookies to be included in requests
-    allow_methods=["*"],            # Allow all standard HTTP methods (GET, POST, etc.)
-    allow_headers=["*"],            # Allow all headers
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+print("CORS middleware added successfully.")
 
 # --- Pydantic Models for Request/Response ---
 class ConversionRequest(BaseModel):
     glb_url: HttpUrl
     output_format: str # Should be "stl" or "obj"
 
+# ... (rest of your app.py code: TEMP_DIR, helper functions, endpoints, etc.)
 # --- Helper Functions ---
 TEMP_DIR = "temp_conversion_files"
+# ... and so on, the rest of your file was fine from here.
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 def cleanup_files(paths: list):
