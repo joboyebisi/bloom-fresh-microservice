@@ -1,131 +1,155 @@
-# File: bloom-fresh-microservice/app.py
-# Required libraries: fastapi, uvicorn, trimesh, requests (or httpx for async)
-
-from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import StreamingResponse 
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-import trimesh
-import requests # Using requests for simplicity; httpx is better for async FastAPI
-import io
-import logging
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, HttpUrl
+import httpx # For making async HTTP requests to download the GLB file
+import trimesh # Assuming you'll use trimesh for conversion
+import os
+import uuid
+import shutil # For cleaning up temporary files
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Initialize FastAPI app
+app = FastAPI(title="3D Model Conversion Microservice")
 
-app = FastAPI()
-
-# CORS Configuration
-# IMPORTANT: Replace "https://your-nextjs-app-name.vercel.app" with your actual deployed Next.js frontend URL
+# --- CORS Configuration ---
+# Define the list of allowed origins (your frontend applications)
 origins = [
-    "http://localhost:3000",  # For local Next.js development
-    "https://bloom-fresh-microservice-ap1bf01at-job-oyebisis-projects.vercel.app", # Placeholder for your deployed Next.js app
-    # You might need to add your Vercel preview deployment URLs for the frontend too,
-    # e.g., "https://bloom-fresh-git-your-branch-your-org.vercel.app"
+    "https://bloom-v0.vercel.app",    # Your deployed Next.js frontend
+    "http://localhost:3000",        # Your local Next.js development server
+    # Add any other frontend origins if necessary
 ]
 
+# Add the CORS middleware to your app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["POST", "GET", "OPTIONS"], # Specify methods or use ["*"] for all
-    allow_headers=["*"], # Specify headers or use ["*"] for all
+    allow_origins=origins,          # Allow specific origins
+    allow_credentials=True,       # Allow cookies to be included in requests
+    allow_methods=["*"],            # Allow all standard HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],            # Allow all headers
 )
 
-# Configuration - In a real app, use environment variables
-PYTHON_MICROSERVICE_PORT = 8001 
+# --- Pydantic Models for Request/Response ---
+class ConversionRequest(BaseModel):
+    glb_url: HttpUrl
+    output_format: str # Should be "stl" or "obj"
+
+# --- Helper Functions ---
+TEMP_DIR = "temp_conversion_files"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def cleanup_files(paths: list):
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            print(f"Cleaned up: {path}")
+        except Exception as e:
+            print(f"Error cleaning up {path}: {e}")
+
+
+async def download_file(url: str, destination: str):
+    async with httpx.AsyncClient(timeout=60.0) as client: # Increased timeout
+        try:
+            response = await client.get(url)
+            response.raise_for_status() # Raise an exception for bad status codes
+            with open(destination, 'wb') as f:
+                f.write(response.content)
+        except httpx.RequestError as e:
+            print(f"Error downloading file from {url}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to download GLB file from URL: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred during download: {e}")
+            raise HTTPException(status_code=500, detail=f"An unexpected error occurred while fetching the GLB: {e}")
+
+
+# --- API Endpoints ---
+@app.get("/")
+async def root():
+    return {"message": "Bloom Fresh 3D Model Conversion Microservice is running!"}
 
 @app.post("/convert")
-async def convert_model_endpoint( 
-    glb_url: str = Body(..., embed=True), 
-    output_format: str = Body(..., embed=True) # "stl" or "obj"
-):
-    logger.info(f"Received conversion request for URL: {glb_url} to format: {output_format}")
-
-    if output_format.lower() not in ["stl", "obj"]:
-        logger.error(f"Invalid output_format: {output_format}")
+async def convert_model_endpoint(request: ConversionRequest, background_tasks: BackgroundTasks):
+    if request.output_format.lower() not in ["stl", "obj"]:
         raise HTTPException(status_code=400, detail="Invalid output_format. Must be 'stl' or 'obj'.")
 
+    unique_id = uuid.uuid4()
+    temp_subdir = os.path.join(TEMP_DIR, str(unique_id))
+    os.makedirs(temp_subdir, exist_ok=True)
+
+    input_glb_path = os.path.join(temp_subdir, f"input_{unique_id}.glb")
+    output_file_path = os.path.join(temp_subdir, f"output_{unique_id}.{request.output_format.lower()}")
+    
+    # Add files to be cleaned up by the background task
+    background_tasks.add_task(cleanup_files, [temp_subdir])
+
     try:
-        # 1. Fetch GLB from URL
-        logger.info(f"Fetching GLB model from: {glb_url}")
-        # Using a timeout for the request
-        response = requests.get(glb_url, stream=True, timeout=30) # 30 seconds timeout
-        response.raise_for_status() 
-        
-        glb_data = response.content
-        logger.info(f"Successfully fetched GLB data, size: {len(glb_data)} bytes.")
+        # 1. Download the GLB file from the provided URL
+        print(f"Attempting to download GLB from: {request.glb_url}")
+        await download_file(str(request.glb_url), input_glb_path)
+        print(f"GLB file downloaded to: {input_glb_path}")
 
-        # 2. Load GLB with Trimesh
-        with io.BytesIO(glb_data) as glb_file_like:
-            scene_or_mesh = trimesh.load(glb_file_like, file_type='glb')
-        
-        logger.info(f"Trimesh loaded model. Type: {type(scene_or_mesh)}")
+        if not os.path.exists(input_glb_path) or os.path.getsize(input_glb_path) == 0:
+            print(f"Failed to download or GLB file is empty: {input_glb_path}")
+            raise HTTPException(status_code=500, detail="Failed to download GLB file or file is empty.")
 
-        if isinstance(scene_or_mesh, trimesh.Scene):
-            if not scene_or_mesh.geometry:
-                logger.error("GLB scene is empty or contains no processable geometry.")
-                raise HTTPException(status_code=400, detail="GLB scene is empty or unsupported.")
-            mesh = trimesh.util.concatenate(list(scene_or_mesh.geometry.values()))
-            logger.info(f"Converted Trimesh scene to a single mesh with {len(mesh.vertices)} vertices.")
-        elif isinstance(scene_or_mesh, trimesh.Trimesh):
-            mesh = scene_or_mesh
-            logger.info(f"Loaded Trimesh mesh directly with {len(mesh.vertices)} vertices.")
-        else:
-            logger.error(f"Unsupported GLB content type after Trimesh load: {type(scene_or_mesh)}")
-            raise HTTPException(status_code=500, detail=f"Unsupported GLB content type: {type(scene_or_mesh)}")
+        # 2. Load the GLB model using trimesh
+        print(f"Loading model with trimesh: {input_glb_path}")
+        try:
+            mesh = trimesh.load_mesh(input_glb_path)
+            if isinstance(mesh, trimesh.Scene): # If it's a scene, try to get a single geometry
+                 if len(mesh.geometry) > 0:
+                    # Concatenate all geometries into a single mesh
+                    # This is a common approach, but might need adjustment based on your models
+                    mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+                 else: # No geometry in scene
+                    raise ValueError("GLB scene contains no geometry to convert.")
+            elif not hasattr(mesh, 'export'): # Check if it's a valid mesh object
+                 raise ValueError("Loaded GLB is not a valid mesh object.")
+            print("Model loaded successfully with trimesh.")
+        except Exception as e:
+            print(f"Error loading GLB with trimesh: {e}")
+            # Before raising, check if the temp_subdir still exists for cleanup context
+            if not os.path.exists(temp_subdir):
+                print(f"Temp subdir {temp_subdir} was unexpectedly removed before trimesh loading error.")
+            raise HTTPException(status_code=500, detail=f"Failed to load GLB model for conversion: {str(e)}")
 
-        if not mesh.vertices.size > 0:
-             logger.error("Mesh has no vertices after processing.")
-             raise HTTPException(status_code=400, detail="Processed mesh has no vertices.")
 
-        # 3. Export to target format
-        export_data = None
-        content_type = "application/octet-stream"
-        filename = f"converted_model_{trimesh.util.now()}.{output_format.lower()}"
+        # 3. Export to the desired format (STL or OBJ)
+        print(f"Exporting model to {request.output_format.lower()} at {output_file_path}")
+        try:
+            export_result = mesh.export(file_type=request.output_format.lower(), file_obj=output_file_path)
+            if not os.path.exists(output_file_path) or os.path.getsize(output_file_path) == 0:
+                 raise ValueError(f"Trimesh export to {request.output_format.lower()} failed or produced an empty file.")
+            print(f"Model exported to {request.output_format.lower()} successfully.")
+        except Exception as e:
+            print(f"Error exporting model with trimesh: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to export model to {request.output_format.lower()}: {str(e)}")
+            
+        # 4. Return the converted file
+        # The actual file sending will be handled by FileResponse.
+        # The background task will clean up the file after response is sent.
+        return FileResponse(
+            path=output_file_path,
+            filename=f"converted_model_{unique_id}.{request.output_format.lower()}",
+            media_type=f"model/{request.output_format.lower()}" if request.output_format.lower() == "stl" else "application/octet-stream",
+            # background=background_tasks # FileResponse can take background tasks directly too
+        )
 
-        logger.info(f"Exporting mesh to {output_format.lower()}")
-        if output_format.lower() == "stl":
-            export_data = mesh.export(file_type="stl")
-            content_type = "model/stl"
-        elif output_format.lower() == "obj":
-            export_data = mesh.export(file_type="obj")
-        
-        if not export_data:
-            logger.error("Model conversion failed to produce data during export.")
-            raise HTTPException(status_code=500, detail="Model conversion failed to produce data.")
-        logger.info(f"Successfully exported to {output_format.lower()}. Data type: {type(export_data)}")
-
-        # 4. Return as a streaming response
-        response_headers = {"Content-Disposition": f"attachment; filename=\"{filename}\""}
-
-        if isinstance(export_data, bytes): 
-            return StreamingResponse(
-                io.BytesIO(export_data),
-                media_type=content_type,
-                headers=response_headers
-            )
-        elif isinstance(export_data, str): 
-            return StreamingResponse(
-                io.BytesIO(export_data.encode('utf-8')),
-                media_type=content_type, 
-                headers=response_headers
-            )
-        else:
-            logger.error(f"Unknown export data type: {type(export_data)}")
-            raise HTTPException(status_code=500, detail="Unknown export data type after conversion.")
-
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout fetching GLB model from URL: {glb_url}")
-        raise HTTPException(status_code=504, detail="Timeout fetching GLB model from URL.")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch GLB model: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Failed to fetch GLB model: {str(e)}")
-    except trimesh.exceptions.TrimeshException as e: 
-        logger.error(f"Trimesh processing error: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Invalid or corrupt GLB file, or Trimesh error: {str(e)}")
+    except HTTPException as http_exc:
+        # Re-raise HTTPException to ensure FastAPI handles it correctly
+        raise http_exc
     except Exception as e:
-        logger.exception("Unexpected error during conversion") 
-        raise HTTPException(status_code=500, detail=f"Internal server error during conversion: {str(e)}")
+        # Catch any other unexpected errors during the process
+        print(f"An unexpected error occurred in /convert endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
 
-# To run: uvicorn app:app --reload --port 8001
+# --- Main execution for local development (optional) ---
+if __name__ == "__main__":
+    import uvicorn
+    # Make sure TEMP_DIR exists when running locally
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
